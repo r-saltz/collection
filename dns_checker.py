@@ -1,18 +1,31 @@
 #!/usr/bin/env python3
-"""DNS Domain Activity Checker v2.1
+"""DNS Domain Activity Checker v3.0 (Async / aiodns)
 Check A record only. Green = active, Red = inactive.
+
+Features:
+  - Async DNS resolution via aiodns
+  - Semaphore-based concurrency (100-500+ coroutines)
+  - In-place progress bar with live stats
+  - Incremental crash-safe file output
+  - Graceful CTRL+C handling
 
 Usage:
     python3 dns_checker.py example.com
     python3 dns_checker.py -f domains.txt
     python3 dns_checker.py -f domains.txt -o results.txt
+    python3 dns_checker.py -f domains.txt -w 200
 """
 
-import socket, sys, os, json, time, signal, argparse, threading
+import socket, sys, os, json, time, signal, argparse, asyncio
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "2.1"
+try:
+    import aiodns
+except ImportError:
+    print("\033[91m[!] aiodns required: pip install aiodns\033[0m")
+    sys.exit(1)
+
+VERSION = "3.0"
 
 # ═══════════════════════════════════════════════════════════════
 # Colors
@@ -58,37 +71,17 @@ def banner():
 \u2551  \u2588\u2588\u2580 \u2580\u2588\u2588\u2588  \u2588\u2588\u2580 \u2588\u2588\u2580 \u2588\u2588\u2588  \u2588\u2588\u2588  \u2588\u2588\u2580 \u2588\u2588\u2580 \u2588\u2588\u2580 \u2588\u2588\u2588  \u2588\u2588  \u2580\u2588\u2588\u2580 \u2580\u2588\u2588\u2580  \u2551
 \u2551  \u2588\u2588       \u2588\u2588\u2580 \u2588\u2588\u2580 \u2588\u2588\u2580 \u2588\u2588\u2580  \u2588\u2588       \u2588\u2588\u2580 \u2588\u2588\u2580 \u2588\u2588\u2580  \u2588\u2588\u2580\u2588\u2588  \u2588\u2588   \u2588\u2588    \u2551
 \u2551  \u2588\u2588       \u2588\u2588     \u2580\u2588\u2580  \u2580\u2588\u2580   \u2588\u2588       \u2580\u2588\u2580   \u2580\u2588\u2580  \u2588\u2588   \u2588\u2588   \u2588\u2588    \u2551
-\u2551       DNS Domain Activity Checker {VERSION:<19}  \u2551
+\u2551       DNS Domain Activity Checker {VERSION:<12} (async/aiodns)  \u2551
 \u255a{'\u2550' * 49}\u255d{C.RESET}
 """)
     print(f"  {C.WHITE}Check   : A Record only")
+    print(f"  {C.WHITE}Engine  : aiodns + asyncio.Semaphore{C.RESET}")
     print(f"  {C.WHITE}Usage   : python3 dns_checker.py [options]{C.RESET}")
     print()
 
 
 # ═══════════════════════════════════════════════════════════════
-# DNS Check - A Record Only
-# ═══════════════════════════════════════════════════════════════
-def check_domain(domain: str) -> dict:
-    domain = domain.strip().lower()
-    domain = domain.replace("http://", "").replace("https://", "").split("/")[0]
-    if not domain:
-        return {"domain": domain, "active": False, "ip": None, "error": "Empty domain"}
-
-    result = {"domain": domain, "active": False, "ip": None, "error": None,
-              "timestamp": datetime.now().isoformat()}
-    try:
-        ips = socket.getaddrinfo(domain, None, socket.AF_INET)
-        if ips:
-            result["active"] = True
-            result["ip"] = list(set(ip[4][0] for ip in ips))
-    except socket.gaierror:
-        result["error"] = "DNS resolution failed"
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════
-# Progress Bar
+# Progress Bar (thread-safe via asyncio.Lock)
 # ═══════════════════════════════════════════════════════════════
 class Progress:
     def __init__(self, total: int):
@@ -97,12 +90,12 @@ class Progress:
         self.active = 0
         self.inactive = 0
         self.start = time.time()
-        self.lock = threading.Lock()
+        self.lock = asyncio.Lock()
 
-    def update(self, result: dict):
-        with self.lock:
+    async def update(self, is_active: bool):
+        async with self.lock:
             self.done += 1
-            if result.get("active"):
+            if is_active:
                 self.active += 1
             else:
                 self.inactive += 1
@@ -132,7 +125,6 @@ def print_result(result: dict, verbose: bool = False):
     error = result.get("error")
 
     if is_active:
-        ip_str = ", ".join(ips) if ips else "resolved"
         print(f"  {C.GREEN}\u251c\u2500 {domain}{C.RESET}")
         for ip in ips:
             print(f"  {C.GREEN}\u2502  \u2192 {ip}{C.RESET}")
@@ -160,22 +152,22 @@ def print_summary(progress: Progress):
 
 
 # ═══════════════════════════════════════════════════════════════
-# File Output (incremental)
+# File Output (incremental, crash-safe)
 # ═══════════════════════════════════════════════════════════════
 class FileOutput:
     def __init__(self, path: str, json_mode: bool = False):
         self.path = path
         self.json_mode = json_mode
         self.results = []
-        self.lock = threading.Lock()
+        self.lock = asyncio.Lock()
         if not json_mode:
             with open(path, "w") as f:
                 f.write(f"# DNS Domain Check - {datetime.now():%Y-%m-%d %H:%M:%S}\n")
                 f.write(f"# {'Domain':<40} {'Status':<10} {'IP'}\n")
                 f.write("# " + "-" * 70 + "\n")
 
-    def write(self, result: dict):
-        with self.lock:
+    async def write(self, result: dict):
+        async with self.lock:
             self.results.append(result)
             if self.json_mode:
                 with open(self.path, "w") as f:
@@ -194,38 +186,63 @@ class FileOutput:
 
 
 # ═══════════════════════════════════════════════════════════════
+# Async DNS Check (aiodns)
+# ═══════════════════════════════════════════════════════════════
+_print_lock = asyncio.Lock()
+
+async def check_domain(domain: str, resolver: aiodns.DNSResolver, sem: asyncio.Semaphore,
+                        progress: Progress, file_out: FileOutput, verbose: bool):
+    global _shutdown
+    if _shutdown:
+        return
+
+    domain = domain.strip().lower()
+    domain = domain.replace("http://", "").replace("https://", "").split("/")[0]
+    if not domain:
+        return
+
+    result = {"domain": domain, "active": False, "ip": None, "error": None,
+              "timestamp": datetime.now().isoformat()}
+
+    async with sem:
+        try:
+            resp = await resolver.getaddrinfo(domain, socket.AF_INET)
+            result["active"] = True
+            # Extract IPs from AddrInfoResult nodes
+            ips = []
+            if hasattr(resp, 'nodes'):
+                for node in resp.nodes:
+                    if hasattr(node, 'addr') and node.addr:
+                        ip = node.addr[0] if isinstance(node.addr, tuple) else node.addr
+                        if isinstance(ip, bytes):
+                            ip = ip.decode()
+                        ips.append(ip)
+            elif hasattr(resp, 'addresses'):
+                ips = resp.addresses
+            result["ip"] = list(set(ips)) if ips else ["resolved"]
+        except aiodns.error.DNSError as e:
+            result["error"] = str(e)
+        except Exception as e:
+            result["error"] = str(e)
+
+    await progress.update(result["active"])
+
+    # Print result + refresh progress bar
+    async with _print_lock:
+        sys.stdout.write("\r" + " " * 120 + "\r")
+        sys.stdout.flush()
+        print_result(result, verbose=verbose)
+        sys.stdout.write(progress.bar())
+        sys.stdout.flush()
+
+    if file_out:
+        await file_out.write(result)
+
+
+# ═══════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════
-def main():
-    parser = argparse.ArgumentParser(
-        description=f"DNS Checker {VERSION} - A Record Domain Activity Checker",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Examples:
-  python3 dns_checker.py example.com
-  python3 dns_checker.py -f domains.txt
-  python3 dns_checker.py -f domains.txt -o results.txt
-  python3 dns_checker.py -f domains.txt -j -o results.json
-  python3 dns_checker.py -f domains.txt -v
-  python3 dns_checker.py -f domains.txt --no-color
-"""
-    )
-
-    parser.add_argument("domains", nargs="*", help="Domain(s) to check")
-    parser.add_argument("-f", "--file", help="File with domains (one per line)")
-    parser.add_argument("-o", "--output", help="Save results to file")
-    parser.add_argument("-j", "--json", action="store_true", help="Output as JSON")
-    parser.add_argument("-w", "--workers", type=int, default=20, help="Concurrent threads (default: 20)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Show error details for inactive")
-    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
-    parser.add_argument("--version", action="version", version=f"DNS Checker {VERSION}")
-
-    args = parser.parse_args()
-
-    if args.no_color or not sys.stdout.isatty():
-        C.disable()
-
-    banner()
-
+async def async_main(args):
     # Collect domains
     domains = list(args.domains) if args.domains else []
     if args.file:
@@ -237,43 +254,27 @@ def main():
                 )
         except FileNotFoundError:
             print(f"{C.RED}[-] File not found: {args.file}{C.RESET}")
-            sys.exit(1)
+            return
 
     if not domains:
-        parser.print_help()
-        sys.exit(1)
+        return
 
     total = len(domains)
     print(f"  {C.CYAN}[*] Loaded {total} domains | {args.workers} workers{C.RESET}")
     print()
 
     # Init
+    resolver = aiodns.DNSResolver(timeout=5, tries=2, rotate=True)
+    sem = asyncio.Semaphore(args.workers)
     progress = Progress(total)
     file_out = FileOutput(args.output, json_mode=args.json) if args.output else None
 
-    # Run checks
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = [executor.submit(check_domain, d) for d in domains]
-        for future in futures:
-            if _shutdown:
-                break
-            try:
-                result = future.result(timeout=15)
-            except Exception as e:
-                result = {"domain": "unknown", "active": False, "ip": None,
-                          "error": str(e), "timestamp": datetime.now().isoformat()}
-
-            progress.update(result)
-
-            # Clear progress line, print result, redraw progress
-            sys.stdout.write("\r" + " " * 120 + "\r")
-            sys.stdout.flush()
-            print_result(result, verbose=args.verbose)
-            sys.stdout.write(progress.bar())
-            sys.stdout.flush()
-
-            if file_out:
-                file_out.write(result)
+    # Run all tasks
+    tasks = [
+        check_domain(d, resolver, sem, progress, file_out, args.verbose)
+        for d in domains
+    ]
+    await asyncio.gather(*tasks)
 
     # Final
     sys.stdout.write("\n")
@@ -289,6 +290,39 @@ def main():
         print(f"  {C.YELLOW}[!] Interrupted \u2014 {progress.done}/{total} completed{C.RESET}")
         if file_out:
             print(f"  {C.DIM}[*] Partial results saved to {args.output}{C.RESET}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=f"DNS Checker {VERSION} - Async A-Record Domain Activity Checker",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  python3 dns_checker.py example.com
+  python3 dns_checker.py -f domains.txt
+  python3 dns_checker.py -f domains.txt -w 200
+  python3 dns_checker.py -f domains.txt -o results.txt
+  python3 dns_checker.py -f domains.txt -j -o results.json
+  python3 dns_checker.py -f domains.txt -v
+  python3 dns_checker.py -f domains.txt --no-color
+"""
+    )
+
+    parser.add_argument("domains", nargs="*", help="Domain(s) to check")
+    parser.add_argument("-f", "--file", help="File with domains (one per line)")
+    parser.add_argument("-o", "--output", help="Save results to file")
+    parser.add_argument("-j", "--json", action="store_true", help="Output as JSON")
+    parser.add_argument("-w", "--workers", type=int, default=100, help="Concurrent workers (default: 100)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show error details for inactive")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    parser.add_argument("--version", action="version", version=f"DNS Checker {VERSION}")
+
+    args = parser.parse_args()
+
+    if args.no_color or not sys.stdout.isatty():
+        C.disable()
+
+    banner()
+    asyncio.run(async_main(args))
 
 
 if __name__ == "__main__":
