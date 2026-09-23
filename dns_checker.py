@@ -3,15 +3,17 @@
 DNS Domain Activity Checker - Live Progress Edition
 Verifies if domains are active by checking DNS resolution.
 
-Layout:
-  TOP    -> Header (fixed)
-  MIDDLE -> Live results (scrolling)
-  BOTTOM -> Progress bar & stats (fixed)
+Display modes (--mode):
+  live    -> Header top, results scroll middle, progress bar fixed bottom
+  compact -> One line per result, no progress bar
+  table   -> Formatted table output after all checks complete
+  quiet   -> Only summary at end, no per-domain output
 
 Usage:
     python3 dns_checker.py example.com
     python3 dns_checker.py -f domains.txt
-    python3 dns_checker.py domain1.com domain2.com domain3.com
+    python3 dns_checker.py -f domains.txt --mode table
+    python3 dns_checker.py -f domains.txt --mode compact --no-color
 """
 
 import socket
@@ -20,6 +22,7 @@ import argparse
 import json
 import time
 import os
+import threading
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -30,6 +33,10 @@ try:
 except ImportError:
     HAS_DNSPYTHON = False
 
+
+# ═══════════════════════════════════════════════════════════════
+#  Colors
+# ═══════════════════════════════════════════════════════════════
 
 class C:
     RESET    = "\033[0m"
@@ -44,41 +51,31 @@ class C:
     BG_GREEN = "\033[42m"
     BG_RED   = "\033[41m"
 
+    @classmethod
+    def disable(cls):
+        for attr in dir(cls):
+            if attr.isupper() and not attr.startswith("_"):
+                setattr(cls, attr, "")
 
-STATS_LINES = 3  # separator + progress_bar + stats
 
-class LiveProgress:
-    """Live progress display with fixed bottom panel and scrolling results."""
+STATS_LINES = 3
 
-    def __init__(self, total: int, output_file: str = None, json_output: bool = False):
+
+# ═══════════════════════════════════════════════════════════════
+#  Display Base Class
+# ═══════════════════════════════════════════════════════════════
+
+class DisplayBase:
+    """Common state and helpers shared by all display modes."""
+
+    def __init__(self, total: int):
         self.total = total
         self.completed = 0
         self.active = 0
         self.inactive = 0
         self.start_time = time.time()
         self.results = []
-        self.output_file = output_file
-        self.json_output = json_output
-        self._file_handle = None
-        self._is_tty = sys.stdout.isatty()
-
-        # Scroll region and stats positions (set in start())
-        self._scroll_top = 1
-        self._scroll_bottom = 24
-        self._stats_row = 22
-
-        if output_file and not json_output:
-            self._file_handle = open(output_file, "w", encoding="utf-8")
-            self._file_handle.write(
-                f"# DNS Domain Check - {datetime.now():%Y-%m-%d %H:%M:%S}\n"
-            )
-            self._file_handle.write(
-                f"# {'Domain':<40} {'Status':<10} {'Records'}\n"
-            )
-            self._file_handle.write("# " + "-" * 80 + "\n")
-            self._file_handle.flush()
-
-    # ── helpers ───────────────────────────────────────────────
+        self.lock = threading.Lock()
 
     def _elapsed(self) -> str:
         return str(timedelta(seconds=int(time.time() - self.start_time)))
@@ -117,7 +114,8 @@ class LiveProgress:
     def _go(row: int, col: int = 1):
         sys.stdout.write(f"\033[{row};{col}H")
 
-    def _format_records(self, records: dict) -> str:
+    @staticmethod
+    def _fmt_records(records: dict) -> str:
         parts = []
         for rtype, values in records.items():
             if rtype in ("A", "AAAA"):
@@ -134,7 +132,40 @@ class LiveProgress:
                 parts.append(f"{C.CYAN}CNAME{C.RESET}:{values[0]}")
         return " ".join(parts) if parts else f"{C.DIM}no records{C.RESET}"
 
-    # ── drawing ───────────────────────────────────────────────
+    @staticmethod
+    def _fmt_status(is_active: bool) -> str:
+        if is_active:
+            return f"{C.GREEN}✓ ACTIVE{C.RESET}"
+        return f"{C.RED}✗ INACTIVE{C.RESET}"
+
+    def _count_result(self, result: dict):
+        with self.lock:
+            self.completed += 1
+            if result.get("active"):
+                self.active += 1
+            else:
+                self.inactive += 1
+            self.results.append(result)
+
+    # abstract
+    def start(self): ...
+    def update(self, result: dict): ...
+    def finish(self): ...
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Mode: live  (default)
+# ═══════════════════════════════════════════════════════════════
+
+class DisplayLive(DisplayBase):
+    """Header top, scrolling results middle, fixed progress bar bottom."""
+
+    def __init__(self, total: int):
+        super().__init__(total)
+        self._is_tty = sys.stdout.isatty()
+        self._scroll_top = 4
+        self._scroll_bottom = 24
+        self._stats_row = 22
 
     def _draw_header(self):
         w = self._tw()
@@ -145,24 +176,18 @@ class LiveProgress:
         print(f"{C.BOLD}{C.CYAN}╚{'═' * (w - 2)}╝{C.RESET}")
 
     def _draw_stats(self):
-        """Draw the fixed bottom stats panel (3 lines)."""
         w = self._tw()
         r = self._stats_row
         bar = self._progress_bar(35)
         pct = (self.completed / self.total * 100) if self.total else 0
 
-        # Line 1: separator
         self._go(r, 1)
         sys.stdout.write(f"\033[2K  {C.DIM}{'━' * (w - 4)}{C.RESET}")
-
-        # Line 2: progress bar
         self._go(r + 1, 1)
         sys.stdout.write(
             f"\033[2K  {bar}  {C.BOLD}{pct:5.1f}%{C.RESET}  "
             f"({self.completed}/{self.total})"
         )
-
-        # Line 3: live counters
         self._go(r + 2, 1)
         sys.stdout.write(
             f"\033[2K  "
@@ -174,99 +199,46 @@ class LiveProgress:
         )
         sys.stdout.flush()
 
-    # ── lifecycle ─────────────────────────────────────────────
-
     def start(self):
         if not self._is_tty:
             print(f"[*] Checking {self.total} domain(s)...")
             return
-
         h = self._th()
-
-        # Layout: header(3 rows) | scroll region | stats(3 rows)
-        self._scroll_top = 4                   # first result row
-        self._scroll_bottom = h - STATS_LINES  # last result row
-        self._stats_row = h - STATS_LINES + 1  # first stats row
-
-        # Clear screen and draw header
+        self._scroll_top = 4
+        self._scroll_bottom = h - STATS_LINES
+        self._stats_row = h - STATS_LINES + 1
         sys.stdout.write("\033[2J\033[H")
         self._draw_header()
-
-        # Set scroll region (only results area scrolls)
         sys.stdout.write(f"\033[{self._scroll_top};{self._scroll_bottom}r")
-
-        # Draw initial stats at fixed bottom
         self._draw_stats()
-
-        # Position cursor at first result row
         self._go(self._scroll_top, 1)
         sys.stdout.flush()
 
     def update(self, result: dict):
-        # Update counters
-        self.completed += 1
-        if result.get("active"):
-            self.active += 1
-        else:
-            self.inactive += 1
-        self.results.append(result)
-
-        # Incremental file write
-        if self._file_handle:
-            domain = result["domain"]
-            status = "ACTIVE" if result.get("active") else "INACTIVE"
-            recs = result.get("records", {})
-            rec_str = ", ".join(
-                f"{k}:{v[0]}" for k, v in recs.items() if v
-            ) if recs else "-"
-            self._file_handle.write(
-                f"  {domain:<40} {status:<10} {rec_str}\n"
-            )
-            self._file_handle.flush()
-
-        # ── terminal display ──────────────────────────────────
+        self._count_result(result)
         domain = result["domain"]
         is_active = result.get("active", False)
-
-        if is_active:
-            icon = f"{C.GREEN}✓{C.RESET}"
-            status_str = f"{C.GREEN}ACTIVE{C.RESET}"
-        else:
-            icon = f"{C.RED}✗{C.RESET}"
-            status_str = f"{C.RED}INACTIVE{C.RESET}"
-
-        records_str = self._format_records(result.get("records", {}))
         line = (
-            f"  {icon} {C.BOLD}{domain:<40}{C.RESET} "
-            f"{status_str:<20} {records_str}"
+            f"  {self._fmt_status(is_active)}  "
+            f"{C.BOLD}{domain:<40}{C.RESET}  "
+            f"{self._fmt_records(result.get('records', {}))}"
         )
-
         if self._is_tty:
-            # Print result inside scroll region (scrolls naturally)
             print(line)
-            # Save cursor, refresh bottom stats, restore cursor
             sys.stdout.write("\033[s")
             self._draw_stats()
             sys.stdout.write("\033[u")
         else:
             print(line)
-
         sys.stdout.flush()
 
     def finish(self):
-        if self._file_handle:
-            self._file_handle.write(
-                f"\n# Summary: {self.total} checked | "
-                f"{self.active} active | {self.inactive} inactive\n"
-            )
-            self._file_handle.close()
-
         if self._is_tty:
-            # Reset scroll region to full screen
             sys.stdout.write("\033[r")
-            # Move cursor past stats panel
             self._go(self._stats_row + STATS_LINES + 1, 1)
+        self._print_summary()
 
+    def _print_summary(self):
         w = self._tw()
         print(f"\n{C.BOLD}{'═' * w}{C.RESET}")
         print(f"  {C.BOLD}📊 SUMMARY{C.RESET}")
@@ -280,17 +252,200 @@ class LiveProgress:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  Mode: compact
+# ═══════════════════════════════════════════════════════════════
+
+class DisplayCompact(DisplayBase):
+    """One line per result, no progress bar, minimal output."""
+
+    def start(self):
+        pass
+
+    def update(self, result: dict):
+        self._count_result(result)
+        domain = result["domain"]
+        is_active = result.get("active", False)
+        if is_active:
+            icon = f"{C.GREEN}✓{C.RESET}"
+        else:
+            icon = f"{C.RED}✗{C.RESET}"
+        print(f"  {icon} {domain}")
+
+    def finish(self):
+        total = self.total
+        act = self.active
+        inact = self.inactive
+        print(f"\n  {C.BOLD}[{act}/{total} active | {inact} inactive | {self._elapsed()} | {self._speed():.1f} dom/s]{C.RESET}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Mode: table
+# ═══════════════════════════════════════════════════════════════
+
+class DisplayTable(DisplayBase):
+    """Formatted table output after all checks complete."""
+
+    def start(self):
+        print(f"\n  {C.DIM}[*] Checking {self.total} domain(s)...{C.RESET}")
+
+    def update(self, result: dict):
+        self._count_result(result)
+        # dot progress
+        pct = self.completed / self.total * 100
+        bar_w = 30
+        filled = int(bar_w * self.completed / self.total)
+        bar = f"{C.GREEN}{'█' * filled}{C.DIM}{'░' * (bar_w - filled)}{C.RESET}"
+        sys.stdout.write(f"\r  {bar}  {pct:5.1f}%  ({self.completed}/{self.total})")
+        sys.stdout.flush()
+
+    def finish(self):
+        sys.stdout.write("\033[2K\r")
+        sys.stdout.flush()
+
+        # Calculate column widths
+        domains = [r["domain"] for r in self.results]
+        max_dom = max(len(d) for d in domains) if domains else 10
+        max_dom = max(max_dom, 8)
+
+        # Header
+        w = max_dom + 30
+        print(f"\n{'─' * w}")
+        print(
+            f"  {C.BOLD}{('Domain').ljust(max_dom)}  "
+            f"{'Status':<10}  "
+            f"{'A/AAAA':<20}  "
+            f"{'Records'}{C.RESET}"
+        )
+        print(f"{'─' * w}")
+
+        for r in self.results:
+            domain = r["domain"]
+            is_active = r.get("active", False)
+            records = r.get("records", {})
+
+            if is_active:
+                status = f"{C.GREEN}ACTIVE{C.RESET}"
+                icon = f"{C.GREEN}✓{C.RESET}"
+            else:
+                status = f"{C.RED}INACTIVE{C.RESET}"
+                icon = f"{C.RED}✗{C.RESET}"
+
+            # Primary IP
+            ip = ""
+            if "A" in records:
+                ip = records["A"][0]
+            elif "AAAA" in records:
+                ip = records["AAAA"][0]
+
+            # Record summary
+            rec_parts = []
+            if "MX" in records:
+                rec_parts.append(f"MX:{records['MX'][0].split()[1]}")
+            if "NS" in records:
+                rec_parts.append(f"NS:{len(records['NS'])}")
+            if "TXT" in records:
+                rec_parts.append(f"TXT:{len(records['TXT'])}")
+            if "SOA" in records:
+                rec_parts.append("SOA")
+            rec_str = " ".join(rec_parts)
+
+            print(
+                f"  {icon} {domain.ljust(max_dom)}  "
+                f"{status:<20}  "
+                f"{ip:<20}  "
+                f"{rec_str}"
+            )
+
+        # Summary
+        print(f"{'─' * w}")
+        print(
+            f"  {C.GREEN}✓ {self.active} active{C.RESET}  "
+            f"{C.RED}✗ {self.inactive} inactive{C.RESET}  "
+            f"{C.DIM}⏱ {self._elapsed()}{C.RESET}  "
+            f"{C.DIM}⚡ {self._speed():.1f} dom/s{C.RESET}"
+        )
+        print(f"{'─' * w}\n")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Mode: quiet
+# ═══════════════════════════════════════════════════════════════
+
+class DisplayQuiet(DisplayBase):
+    """Only summary at end, no per-domain output."""
+
+    def start(self):
+        pass
+
+    def update(self, result: dict):
+        self._count_result(result)
+
+    def finish(self):
+        print(
+            f"  {C.BOLD}{self.total}{C.RESET} checked  "
+            f"{C.GREEN}✓ {self.active}{C.RESET}  "
+            f"{C.RED}✗ {self.inactive}{C.RESET}  "
+            f"{C.DIM}{self._elapsed()}  {self._speed():.1f} dom/s{C.RESET}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  File writer (incremental)
+# ═══════════════════════════════════════════════════════════════
+
+class FileOutput:
+    """Writes results to file incrementally as they arrive."""
+
+    def __init__(self, path: str):
+        self._fh = open(path, "w", encoding="utf-8")
+        self._fh.write(
+            f"# DNS Domain Check - {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+        )
+        self._fh.write(
+            f"# {'Domain':<40} {'Status':<10} {'Records'}\n"
+        )
+        self._fh.write("# " + "-" * 80 + "\n")
+        self._fh.flush()
+
+    def write(self, result: dict):
+        domain = result["domain"]
+        status = "ACTIVE" if result.get("active") else "INACTIVE"
+        recs = result.get("records", {})
+        rec_str = (
+            ", ".join(f"{k}:{v[0]}" for k, v in recs.items() if v)
+            if recs else "-"
+        )
+        self._fh.write(f"  {domain:<40} {status:<10} {rec_str}\n")
+        self._fh.flush()
+
+    def close(self, total: int, active: int, inactive: int):
+        self._fh.write(
+            f"\n# Summary: {total} checked | "
+            f"{active} active | {inactive} inactive\n"
+        )
+        self._fh.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Display factory
+# ═══════════════════════════════════════════════════════════════
+
+DISPLAY_MODES = {
+    "live": DisplayLive,
+    "compact": DisplayCompact,
+    "table": DisplayTable,
+    "quiet": DisplayQuiet,
+}
+
+
+# ═══════════════════════════════════════════════════════════════
 #  DNS Checking Functions
 # ═══════════════════════════════════════════════════════════════
 
 def check_domain_basic(domain: str) -> dict:
-    """Check domain using standard socket library (always available)."""
     result = {
-        "domain": domain,
-        "active": False,
-        "records": {},
-        "error": None,
-        "timestamp": datetime.now().isoformat(),
+        "domain": domain, "active": False, "records": {},
+        "error": None, "timestamp": datetime.now().isoformat(),
     }
     try:
         ips = socket.getaddrinfo(domain, None, socket.AF_INET)
@@ -312,21 +467,16 @@ def check_domain_basic(domain: str) -> dict:
 
 
 def check_domain_full(domain: str, nameserver: str = None) -> dict:
-    """Check domain using dnspython for detailed DNS records."""
     result = {
-        "domain": domain,
-        "active": False,
-        "records": {},
+        "domain": domain, "active": False, "records": {},
         "nameserver": nameserver or "system default",
-        "error": None,
-        "timestamp": datetime.now().isoformat(),
+        "error": None, "timestamp": datetime.now().isoformat(),
     }
     resolver = dns.resolver.Resolver()
     if nameserver:
         resolver.nameservers = [nameserver]
     resolver.timeout = 5
     resolver.lifetime = 10
-
     for rtype in ["A", "AAAA", "MX", "NS", "TXT", "SOA", "CNAME"]:
         try:
             answers = resolver.resolve(domain, rtype)
@@ -335,23 +485,19 @@ def check_domain_full(domain: str, nameserver: str = None) -> dict:
                 result["records"][rtype] = records
                 result["active"] = True
         except (
-            dns.resolver.NoAnswer,
-            dns.resolver.NXDOMAIN,
-            dns.resolver.NoNameservers,
-            dns.exception.Timeout,
+            dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers, dns.exception.Timeout,
             dns.name.EmptyLabel,
         ):
             pass
         except Exception:
             pass
-
     if not result["active"]:
         result["error"] = "No DNS records found - domain appears inactive"
     return result
 
 
 def check_domain(domain: str, nameserver: str = None) -> dict:
-    """Check single domain - uses dnspython if available, fallback to basic."""
     domain = domain.strip().lower()
     domain = domain.replace("http://", "").replace("https://", "")
     domain = domain.split("/")[0]
@@ -371,10 +517,17 @@ def main():
         description="DNS Domain Activity Checker - Live Progress Edition",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
+            "Display Modes (--mode):\n"
+            "  live     Header + scrolling results + fixed progress bar (default)\n"
+            "  compact  One line per domain, no progress bar\n"
+            "  table    Formatted table after all checks complete\n"
+            "  quiet    Only summary at end\n"
+            "\n"
             "Examples:\n"
             "  python3 dns_checker.py example.com\n"
-            "  python3 dns_checker.py google.com github.com cloudflare.com\n"
             "  python3 dns_checker.py -f domains.txt\n"
+            "  python3 dns_checker.py -f domains.txt --mode table\n"
+            "  python3 dns_checker.py -f domains.txt --mode compact --no-color\n"
             "  python3 dns_checker.py -f domains.txt -j -o results.json\n"
             "  python3 dns_checker.py example.com --ns 8.8.8.8\n"
         ),
@@ -383,6 +536,14 @@ def main():
     parser.add_argument("domains", nargs="*", help="Domain(s) to check")
     parser.add_argument("-f", "--file", help="File with domains (one per line)")
     parser.add_argument("--ns", "--nameserver", help="DNS nameserver to use")
+    parser.add_argument(
+        "--mode", choices=list(DISPLAY_MODES.keys()), default="live",
+        help="Display mode (default: live)",
+    )
+    parser.add_argument(
+        "--no-color", action="store_true",
+        help="Disable colored output (for piping)",
+    )
     parser.add_argument("-j", "--json", action="store_true", help="Output as JSON at end")
     parser.add_argument("-o", "--output", help="Save results to file (live incremental)")
     parser.add_argument(
@@ -391,6 +552,10 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Disable colors if requested or piped
+    if args.no_color or not sys.stdout.isatty():
+        C.disable()
 
     # Collect domains
     domains = list(args.domains) if args.domains else []
@@ -413,17 +578,19 @@ def main():
         print(f"\n  {C.YELLOW}[!] dnspython not installed - using basic socket resolution{C.RESET}")
         print(f"  {C.DIM}    Install for full features: pip install dnspython{C.RESET}")
 
-    # Init live progress
-    progress = LiveProgress(
-        total=len(domains),
-        output_file=args.output,
-        json_output=args.json,
-    )
-    progress.start()
+    # Init display mode
+    display_cls = DISPLAY_MODES[args.mode]
+    display = display_cls(total=len(domains))
+
+    # Init file output
+    file_out = None
+    if args.output:
+        file_out = FileOutput(args.output)
+
+    display.start()
 
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            # Submit all at once (fast), but iterate in ORIGINAL order
             futures = [
                 executor.submit(check_domain, d, args.ns)
                 for d in domains
@@ -433,24 +600,31 @@ def main():
                     result = future.result()
                 except Exception as e:
                     result = {
-                        "domain": "unknown",
-                        "active": False,
+                        "domain": "unknown", "active": False,
                         "error": str(e),
                         "timestamp": datetime.now().isoformat(),
                     }
-                progress.update(result)
+                display.update(result)
+                if file_out:
+                    file_out.write(result)
 
-        progress.finish()
+        display.finish()
+
+        if file_out:
+            file_out.close(display.total, display.active, display.inactive)
 
     except KeyboardInterrupt:
-        sys.stdout.write("\033[r")  # reset scroll region
-        print(f"\n\n  {C.YELLOW}[!] Interrupted - {progress.completed}/{progress.total} completed{C.RESET}")
-        progress.finish()
+        if isinstance(display, DisplayLive) and sys.stdout.isatty():
+            sys.stdout.write("\033[r")
+        print(f"\n  {C.YELLOW}[!] Interrupted - {display.completed}/{display.total} completed{C.RESET}")
+        display.finish()
+        if file_out:
+            file_out.close(display.total, display.active, display.inactive)
         sys.exit(130)
 
     # JSON output
     if args.json:
-        json_out = json.dumps(progress.results, indent=2, ensure_ascii=False)
+        json_out = json.dumps(display.results, indent=2, ensure_ascii=False)
         print(f"\n{C.DIM}[JSON Output]{C.RESET}")
         print(json_out)
         if args.output and args.output.endswith(".json"):
