@@ -189,6 +189,7 @@ class FileOutput:
 # Async DNS Check (aiodns)
 # ═══════════════════════════════════════════════════════════════
 _print_lock = asyncio.Lock()
+_weblive_lock = asyncio.Lock()
 
 async def check_domain(domain: str, resolver: aiodns.DNSResolver, sem: asyncio.Semaphore,
                         progress: Progress, file_out: FileOutput, verbose: bool):
@@ -238,6 +239,12 @@ async def check_domain(domain: str, resolver: aiodns.DNSResolver, sem: asyncio.S
     if file_out:
         await file_out.write(result)
 
+    # Save active domains to weblive.txt (default)
+    if result["active"]:
+        async with _weblive_lock:
+            with open("weblive.txt", "a") as f:
+                f.write(domain + "\n")
+
 
 # ═══════════════════════════════════════════════════════════════
 # Main
@@ -263,6 +270,10 @@ async def async_main(args):
     print(f"  {C.CYAN}[*] Loaded {total} domains | {args.workers} workers{C.RESET}")
     print()
 
+    # Init weblive.txt (default output - active domains only)
+    with open("weblive.txt", "w") as f:
+        f.write(f"# Active domains - {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+
     # Init
     resolver = aiodns.DNSResolver(timeout=5, tries=2, rotate=True)
     sem = asyncio.Semaphore(args.workers)
@@ -285,6 +296,11 @@ async def async_main(args):
 
     if progress.done > 1:
         print_summary(progress)
+
+    # Show weblive.txt info
+    if progress.active > 0:
+        print(f"  {C.GREEN}[*] {progress.active} active domains saved to weblive.txt{C.RESET}")
+        print()
 
     if _shutdown:
         print(f"  {C.YELLOW}[!] Interrupted \u2014 {progress.done}/{total} completed{C.RESET}")
