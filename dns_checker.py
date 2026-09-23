@@ -423,16 +423,17 @@ def main():
 
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = {
-                executor.submit(check_domain, d, args.ns): d
+            # Submit all at once (fast), but iterate in ORIGINAL order
+            futures = [
+                executor.submit(check_domain, d, args.ns)
                 for d in domains
-            }
-            for future in as_completed(futures):
+            ]
+            for future in futures:
                 try:
                     result = future.result()
                 except Exception as e:
                     result = {
-                        "domain": futures[future],
+                        "domain": "unknown",
                         "active": False,
                         "error": str(e),
                         "timestamp": datetime.now().isoformat(),
