@@ -306,15 +306,13 @@ async def scan_target(session: aiohttp.ClientSession, url: str, sem: asyncio.Sem
 
     await progress.update(cms)
 
-    # Save to result files
+    # Save to result files (persistent handles)
     if cms == "laravel":
         async with out_files["laravel_lock"]:
-            with open(out_files["laravel_path"], "a") as f:
-                f.write(domain + "\n")
+            out_files["laravel_fh"].write(domain + "\n")
     elif cms == "wordpress":
         async with out_files["wp_lock"]:
-            with open(out_files["wp_path"], "a") as f:
-                f.write(domain + "\n")
+            out_files["wp_fh"].write(domain + "\n")
 
     # Print result
     async with _print_lock:
@@ -383,16 +381,18 @@ async def async_main(args):
     # Create output directory
     os.makedirs(out_dir, exist_ok=True)
 
-    # Init output files
+    # Init output files (persistent handles for entire scan)
     lar_path = os.path.join(out_dir, "laravel.txt")
     wp_path = os.path.join(out_dir, "wordpress.txt")
 
-    with open(lar_path, "w") as f:
-        f.write(f"# Laravel targets - {datetime.now():%Y-%m-%d %H:%M:%S}\n")
-    with open(wp_path, "w") as f:
-        f.write(f"# WordPress targets - {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+    lar_fh = open(lar_path, "w", buffering=1)  # line-buffered
+    wp_fh = open(wp_path, "w", buffering=1)
+    lar_fh.write(f"# Laravel targets - {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+    wp_fh.write(f"# WordPress targets - {datetime.now():%Y-%m-%d %H:%M:%S}\n")
 
     out_files = {
+        "laravel_fh": lar_fh,
+        "wp_fh": wp_fh,
         "laravel_path": lar_path,
         "wp_path": wp_path,
         "laravel_lock": asyncio.Lock(),
@@ -415,6 +415,10 @@ async def async_main(args):
             for t in targets
         ]
         await asyncio.gather(*tasks)
+
+    # Close persistent file handles
+    lar_fh.close()
+    wp_fh.close()
 
     # Final
     sys.stdout.write("\n")
