@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""CMS Detector v1.0 (Async / aiohttp)
-Detect Laravel and WordPress CMS from URL lists.
+"""CMS Detector v1.1 (Async / aiohttp)
+Detect Laravel, WordPress, and Vite.js from URL lists.
 
 Detection:
   - WordPress: wp-content, wp-includes, wp-login, wp-json, generator meta
   - Laravel: XSRF-TOKEN, laravel_session, /api routes, 419 status
+  - Vite.js: @vite, __vite__, /@vite/, vite-modulepreload, /@vite/client
 
 Output:
   - result/laravel.txt   (Laravel domains)
   - result/wordpress.txt (WordPress domains)
+  - result/vite.txt      (Vite.js domains)
 
 Usage:
     python3 cmsdetect.py example.com
@@ -26,11 +28,11 @@ except ImportError:
     print("\033[91m[!] aiohttp required: pip install aiohttp\033[0m")
     sys.exit(1)
 
-VERSION = "1.0"
+VERSION = "1.1"
 
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 # Colors
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 class C:
     RED     = "\033[91m"
     GREEN   = "\033[92m"
@@ -49,17 +51,17 @@ class C:
                 setattr(cls, attr, "")
 
 
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 # SSL
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
 
 
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 # CTRL+C Graceful Shutdown
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 _shutdown = False
 def _sigint_handler(sig, frame):
     global _shutdown
@@ -71,9 +73,9 @@ def _sigint_handler(sig, frame):
 signal.signal(signal.SIGINT, _sigint_handler)
 
 
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 # Banner
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 def banner():
     print(f"""{C.CYAN}{C.BOLD}
 \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
@@ -84,21 +86,22 @@ def banner():
 \u2551       CMS Detector {VERSION:<22} (async/aiohttp)  \u2551
 \u255a{'\u2550' * 49}\u255d{C.RESET}
 """)
-    print(f"  {C.WHITE}Detect  : Laravel, WordPress")
-    print(f"  {C.WHITE}Output  : result/laravel.txt, result/wordpress.txt{C.RESET}")
+    print(f"  {C.WHITE}Detect  : Laravel, WordPress, Vite.js")
+    print(f"  {C.WHITE}Output  : result/laravel.txt, result/wordpress.txt, result/vite.txt{C.RESET}")
     print(f"  {C.WHITE}Usage   : python3 cmsdetect.py [options]{C.RESET}")
     print()
 
 
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 # Progress Bar
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 class Progress:
     def __init__(self, total: int):
         self.total = total
         self.done = 0
         self.laravel = 0
         self.wordpress = 0
+        self.vite = 0
         self.unknown = 0
         self.start = time.time()
         self.lock = asyncio.Lock()
@@ -110,6 +113,8 @@ class Progress:
                 self.laravel += 1
             elif cms == "wordpress":
                 self.wordpress += 1
+            elif cms == "vite":
+                self.vite += 1
             else:
                 self.unknown += 1
 
@@ -123,15 +128,16 @@ class Progress:
             f"\r  [{bar_str}] {self.done}/{self.total} ({pct}%)"
             f" | {C.MAGENTA}Laravel:{self.laravel}{C.RESET}"
             f" | {C.YELLOW}WordPress:{self.wordpress}{C.RESET}"
+            f" | {C.GREEN}Vite:{self.vite}{C.RESET}"
             f" | {C.DIM}Other:{self.unknown}{C.RESET}"
             f" | {speed:.0f}/s"
             f" | {elapsed:.0f}s"
         )
 
 
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 # CMS Detection Signatures
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 WP_BODY_SIGS = [
     "wp-content/",
     "wp-includes/",
@@ -164,10 +170,29 @@ LARAVEL_BODY_SIGS = [
     "laravel_session",
 ]
 
+# Vite.js signatures
+VITE_BODY_SIGS = [
+    "/@vite/",
+    "@vite/client",
+    "__vite__",
+    "vite/client",
+    "vite-modulepreload",
+    "vite-plugin-",
+    "@vitejs/",
+    "vite-hmr",
+    "create-vite",
+    "modulepreload-polyfill",
+]
 
-# ═══════════════════════════════════════════════════════════════
+VITE_HEADER_SIGS = [
+    "x-powered-by: vite",
+    "server: vite",
+]
+
+
+# ===================================================
 # HTTP Request Helper
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 async def fetch(session: aiohttp.ClientSession, url: str, timeout: int = 10) -> tuple:
     """GET request returning (status, headers_dict, body_str, cookies_dict)."""
     ct = aiohttp.ClientTimeout(total=timeout, connect=5)
@@ -181,11 +206,11 @@ async def fetch(session: aiohttp.ClientSession, url: str, timeout: int = 10) -> 
         return 0, {}, "", {}
 
 
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 # Detection Logic
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 async def detect_cms(session: aiohttp.ClientSession, url: str, timeout: int = 10) -> str:
-    """Detect CMS type. Returns 'wordpress', 'laravel', or 'unknown'."""
+    """Detect CMS type. Returns 'wordpress', 'laravel', 'vite', or 'unknown'."""
     url = url.strip().rstrip("/")
     if not url:
         return "unknown"
@@ -194,51 +219,54 @@ async def detect_cms(session: aiohttp.ClientSession, url: str, timeout: int = 10
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    # ── Step 1: Probe / (main page) ──────────────────────────
+    # -- Step 1: Probe / (main page) --
     status, headers, body, cookies = await fetch(session, url, timeout)
 
     # Check WordPress
     wp_score = 0
-    # Header checks
     for sig in WP_HEADER_SIGS:
         key, _, val = sig.partition(": ")
         h_val = headers.get(key, "")
         if val in h_val:
             wp_score += 3
-    # Body checks
     for sig in WP_BODY_SIGS:
         if sig in body:
             wp_score += 1
-    # Generator meta tag (strong WP signal)
     if "content=\"wordpress" in body:
         wp_score += 5
 
     # Check Laravel
     lar_score = 0
-    # Cookie checks (strong signal)
     for sig in LARAVEL_COOKIE_SIGS:
         if sig.lower() in cookies:
             lar_score += 3
-    # Header checks
     for sig in LARAVEL_HEADER_SIGS:
         key, _, val = sig.partition(": ")
         h_val = headers.get(key, "")
         if val in h_val:
             lar_score += 3
-    # 419 status (Laravel CSRF protection)
     if status == 419:
         lar_score += 2
-    # Body checks
     for sig in LARAVEL_BODY_SIGS:
         if sig in body:
             lar_score += 1
-    # Laravel token meta
     if "csrf-token" in body and "laravel" in body:
         lar_score += 3
 
-    # ── Step 2: Probe known paths if main page inconclusive ──
+    # Check Vite.js
+    vite_score = 0
+    for sig in VITE_HEADER_SIGS:
+        key, _, val = sig.partition(": ")
+        h_val = headers.get(key, "")
+        if val in h_val:
+            vite_score += 5
+    for sig in VITE_BODY_SIGS:
+        if sig in body:
+            vite_score += 2
+
+    # -- Step 2: Probe known paths if inconclusive --
     # WordPress probe
-    if wp_score < 3:
+    if wp_score < 4:
         wp_status, _, wp_body, _ = await fetch(session, f"{url}/wp-login.php", timeout)
         if wp_status == 200 and ("wp-login" in wp_body or "wordpress" in wp_body):
             wp_score += 5
@@ -252,15 +280,13 @@ async def detect_cms(session: aiohttp.ClientSession, url: str, timeout: int = 10
             wp_score += 3
 
     # Laravel probe
-    if lar_score < 3:
-        # Try /api route (Laravel default)
-        api_status, api_headers, api_body, _ = await fetch(session, f"{url}/api", timeout)
+    if lar_score < 4:
+        api_status, _, api_body, _ = await fetch(session, f"{url}/api", timeout)
         if api_status in (200, 401, 403, 405, 429):
             lar_score += 2
         if api_status == 200 and "laravel" in api_body:
             lar_score += 3
 
-        # Try /login (common Laravel route)
         login_status, _, login_body, login_cookies = await fetch(session, f"{url}/login", timeout)
         for sig in LARAVEL_COOKIE_SIGS:
             if sig.lower() in login_cookies:
@@ -270,23 +296,39 @@ async def detect_cms(session: aiohttp.ClientSession, url: str, timeout: int = 10
         if login_status == 419:
             lar_score += 2
 
-    # ── Step 3: Score comparison ──────────────────────────────
-    # WordPress needs strong evidence
-    if wp_score >= 4 and wp_score > lar_score:
-        return "wordpress"
-    # Laravel needs strong evidence
-    if lar_score >= 4 and lar_score > wp_score:
-        return "laravel"
-    # Both detected (rare, e.g. WP with Laravel-like cache)
-    if wp_score >= 4 and lar_score >= 4:
-        return "wordpress" if wp_score >= lar_score else "laravel"
+    # Vite.js probe
+    if vite_score < 4:
+        vite_status, _, vite_body, _ = await fetch(session, f"{url}/@vite/client", timeout)
+        if vite_status == 200 and ("vite" in vite_body or "import" in vite_body):
+            vite_score += 5
+
+        vite_status2, _, vite_body2, _ = await fetch(session, f"{url}/node_modules/vite/dist/client/client.mjs", timeout)
+        if vite_status2 == 200:
+            vite_score += 3
+
+    # -- Step 3: Score comparison --
+    scores = {
+        "wordpress": wp_score,
+        "laravel": lar_score,
+        "vite": vite_score,
+    }
+
+    best = max(scores, key=scores.get)
+    best_score = scores[best]
+
+    # Require minimum threshold and clear winner
+    if best_score >= 4:
+        # Check no tie
+        others = [s for k, s in scores.items() if k != best]
+        if best_score > max(others):
+            return best
 
     return "unknown"
 
 
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 # Async Scan Worker
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 _print_lock = asyncio.Lock()
 
 async def scan_target(session: aiohttp.ClientSession, url: str, sem: asyncio.Semaphore,
@@ -313,6 +355,9 @@ async def scan_target(session: aiohttp.ClientSession, url: str, sem: asyncio.Sem
     elif cms == "wordpress":
         async with out_files["wp_lock"]:
             out_files["wp_fh"].write(domain + "\n")
+    elif cms == "vite":
+        async with out_files["vite_lock"]:
+            out_files["vite_fh"].write(domain + "\n")
 
     # Print result
     async with _print_lock:
@@ -322,15 +367,17 @@ async def scan_target(session: aiohttp.ClientSession, url: str, sem: asyncio.Sem
             print(f"  {C.MAGENTA}\u251c\u2500 {domain} \u2192 Laravel{C.RESET}")
         elif cms == "wordpress":
             print(f"  {C.YELLOW}\u251c\u2500 {domain} \u2192 WordPress{C.RESET}")
+        elif cms == "vite":
+            print(f"  {C.GREEN}\u251c\u2500 {domain} \u2192 Vite.js{C.RESET}")
         elif verbose:
             print(f"  {C.DIM}\u251c\u2500 {domain} \u2192 Unknown{C.RESET}")
         sys.stdout.write(progress.bar())
         sys.stdout.flush()
 
 
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 # Summary
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 def print_summary(progress: Progress, out_dir: str):
     elapsed = time.time() - progress.start
     speed = progress.done / max(elapsed, 0.01)
@@ -343,6 +390,7 @@ def print_summary(progress: Progress, out_dir: str):
     print(f"  {C.WHITE}Total       {C.BOLD}{progress.done}{C.RESET}")
     print(f"  {C.MAGENTA}Laravel     {progress.laravel}{C.RESET}")
     print(f"  {C.YELLOW}WordPress   {progress.wordpress}{C.RESET}")
+    print(f"  {C.GREEN}Vite.js     {progress.vite}{C.RESET}")
     print(f"  {C.DIM}Unknown     {progress.unknown}{C.RESET}")
     print(f"  {C.DIM}Time        {elapsed:.1f}s ({speed:.1f} targets/sec){C.RESET}")
     print(f"{C.CYAN}{'='*50}{C.RESET}")
@@ -351,13 +399,15 @@ def print_summary(progress: Progress, out_dir: str):
         print(f"  {C.MAGENTA}[*] {progress.laravel} Laravel targets \u2192 {out_dir}/laravel.txt{C.RESET}")
     if progress.wordpress > 0:
         print(f"  {C.YELLOW}[*] {progress.wordpress} WordPress targets \u2192 {out_dir}/wordpress.txt{C.RESET}")
-    if progress.laravel > 0 or progress.wordpress > 0:
+    if progress.vite > 0:
+        print(f"  {C.GREEN}[*] {progress.vite} Vite.js targets \u2192 {out_dir}/vite.txt{C.RESET}")
+    if progress.laravel > 0 or progress.wordpress > 0 or progress.vite > 0:
         print()
 
 
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 # Main
-# ═══════════════════════════════════════════════════════════════
+# ===================================================
 async def async_main(args):
     # Collect targets
     targets = list(args.targets) if args.targets else []
@@ -384,19 +434,25 @@ async def async_main(args):
     # Init output files (persistent handles for entire scan)
     lar_path = os.path.join(out_dir, "laravel.txt")
     wp_path = os.path.join(out_dir, "wordpress.txt")
+    vite_path = os.path.join(out_dir, "vite.txt")
 
-    lar_fh = open(lar_path, "w", buffering=1)  # line-buffered
+    lar_fh = open(lar_path, "w", buffering=1)
     wp_fh = open(wp_path, "w", buffering=1)
+    vite_fh = open(vite_path, "w", buffering=1)
     lar_fh.write(f"# Laravel targets - {datetime.now():%Y-%m-%d %H:%M:%S}\n")
     wp_fh.write(f"# WordPress targets - {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+    vite_fh.write(f"# Vite.js targets - {datetime.now():%Y-%m-%d %H:%M:%S}\n")
 
     out_files = {
         "laravel_fh": lar_fh,
         "wp_fh": wp_fh,
+        "vite_fh": vite_fh,
         "laravel_path": lar_path,
         "wp_path": wp_path,
+        "vite_path": vite_path,
         "laravel_lock": asyncio.Lock(),
         "wp_lock": asyncio.Lock(),
+        "vite_lock": asyncio.Lock(),
     }
 
     print(f"  {C.CYAN}[*] Loaded {total} targets | {args.workers} workers | timeout {args.timeout}s{C.RESET}")
@@ -419,6 +475,7 @@ async def async_main(args):
     # Close persistent file handles
     lar_fh.close()
     wp_fh.close()
+    vite_fh.close()
 
     # Final
     sys.stdout.write("\n")
@@ -433,7 +490,7 @@ async def async_main(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description=f"CMS Detector {VERSION} - Detect Laravel & WordPress (Async)",
+        description=f"CMS Detector {VERSION} - Detect Laravel, WordPress & Vite.js (Async)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   python3 cmsdetect.py example.com
