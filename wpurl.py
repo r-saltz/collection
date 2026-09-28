@@ -337,6 +337,18 @@ WP_BODY_SIGS = [
 ]
 WP_HEADER_SIGS = ["x-powered-by: wordpress", "link: <http.*wp-json"]
 
+# REST API endpoints for probing
+WP_REST_ENDPOINTS = [
+    "/wp-json/wp/v2/pages?per_page=1&_fields=id,slug,link,template",
+    "/?rest_route=/wp/v2/pages&per_page=1&_fields=id,slug,link,template",
+    "/wp-json/batch/v1",
+    "/wp/v2/block-renderer/core/paragraph",
+]
+
+# Endpoints for template extraction
+WP_TEMPLATE_ENDPOINT = "/wp-json/wp/v2/pages?per_page=100&_fields=id,slug,link,template"
+WP_TEMPLATE_ALT = "/?rest_route=/wp/v2/pages&per_page=100&_fields=id,slug,link,template"
+
 
 async def http_get(session, url: str, timeout: int) -> tuple:
     ct = aiohttp.ClientTimeout(total=timeout, connect=5)
@@ -347,6 +359,96 @@ async def http_get(session, url: str, timeout: int) -> tuple:
             return resp.status, headers, body.lower()
     except Exception:
         return 0, {}, ""
+
+
+async def http_get_json(session, url: str, timeout: int) -> tuple:
+    """GET request returning (status, json_data or None)."""
+    ct = aiohttp.ClientTimeout(total=timeout, connect=5)
+    try:
+        async with session.get(url, timeout=ct, allow_redirects=True, ssl=False) as resp:
+            if resp.status == 200:
+                try:
+                    data = await resp.json()
+                    return resp.status, data
+                except Exception:
+                    pass
+            return resp.status, None
+    except Exception:
+        return 0, None
+
+
+async def extract_templates(session, domain: str, timeout: int) -> list:
+    """Extract templates from WP pages via REST API."""
+    url = f"https://{domain}"
+
+    # Try primary endpoint
+    s, data = await http_get_json(session, f"{url}{WP_TEMPLATE_ENDPOINT}", timeout)
+    if s == 200 and isinstance(data, list):
+        templates = []
+        for page in data:
+            tpl = page.get("template", "")
+            slug = page.get("slug", "")
+            if tpl:
+                templates.append(f"{slug}={tpl}")
+        return templates
+
+    # Try alternative endpoint
+    s2, data2 = await http_get_json(session, f"{url}{WP_TEMPLATE_ALT}", timeout)
+    if s2 == 200 and isinstance(data2, list):
+        templates = []
+        for page in data2:
+            tpl = page.get("template", "")
+            slug = page.get("slug", "")
+            if tpl:
+                templates.append(f"{slug}={tpl}")
+        return templates
+
+    return []
+
+
+async def _is_wp(session, domain: str, timeout: int) -> bool:
+    url = f"https://{domain}"
+
+    # 1. Check main page headers + body
+    status, headers, body = await http_get(session, url, timeout)
+    score = 0
+    for sig in WP_HEADER_SIGS:
+        key, _, val = sig.partition(": ")
+        if val in headers.get(key, ""):
+            score += 3
+    for sig in WP_BODY_SIGS:
+        if sig in body:
+            score += 1
+    if 'content="wordpress' in body:
+        score += 5
+    if score >= 4:
+        return True
+
+    # 2. Probe wp-login.php
+    s2, _, b2 = await http_get(session, f"{url}/wp-login.php", timeout)
+    if s2 == 200 and ("wp-login" in b2 or "wordpress" in b2):
+        return True
+
+    # 3. Probe wp-json
+    s3, _, b3 = await http_get(session, f"{url}/wp-json", timeout)
+    if s3 == 200 and ("wp-json" in b3 or "namespaces" in b3):
+        return True
+
+    # 4. Probe REST API endpoints
+    for endpoint in WP_REST_ENDPOINTS:
+        s, data = await http_get_json(session, f"{url}{endpoint}", timeout)
+        if s == 200 and data is not None:
+            if isinstance(data, (list, dict)):
+                return True
+
+    # 5. Probe REST API via JSON body check
+    for endpoint in WP_REST_ENDPOINTS:
+        s, _, b = await http_get(session, f"{url}{endpoint}", timeout)
+        if s == 200 and b:
+            if any(sig in b for sig in ["wp-json", "namespace", "wp/v2", "block-renderer", "batch"]):
+                return True
+
+    return False
 
 
 async def phase_wp(domains: list, workers: int, timeout: int) -> list:
@@ -370,7 +472,8 @@ async def phase_wp(domains: list, workers: int, timeout: int) -> list:
                 wp = await _is_wp(session, domain, timeout)
             await progress.update("wordpress" if wp else "other")
             if wp:
-                wp_domains.append(domain)
+                templates = await extract_templates(session, domain, timeout)
+                wp_domains.append({"domain": domain, "templates": templates})
             async with _print_lock:
                 sys.stdout.write(progress.bar())
                 sys.stdout.flush()
@@ -445,11 +548,24 @@ async def async_main(args):
     # Output
     out_file = args.output
     with open(out_file, "w") as f:
-        for d in sorted(set(wp_domains)):
-            f.write(d + "\n")
+        for item in sorted(wp_domains, key=lambda x: x["domain"]):
+            domain = item["domain"]
+            templates = item.get("templates", [])
+            if templates:
+                f.write(f"{domain} | {', '.join(templates)}\n")
+            else:
+                f.write(f"{domain}\n")
 
     if wp_domains:
         print(f"  {C.GREEN}{C.BOLD}[*] {len(wp_domains)} WordPress sites \u2192 {out_file}{C.RESET}")
+        # Show templates in terminal
+        for item in sorted(wp_domains, key=lambda x: x["domain"]):
+            domain = item["domain"]
+            templates = item.get("templates", [])
+            if templates:
+                print(f"  {C.GREEN}  \u2514 {domain} \u2192 {', '.join(templates)}{C.RESET}")
+            else:
+                print(f"  {C.GREEN}  \u2514 {domain}{C.RESET}")
     else:
         print(f"  {C.YELLOW}[*] No WordPress sites found.{C.RESET}")
 
