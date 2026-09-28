@@ -126,8 +126,6 @@ def print_result(result: dict, verbose: bool = False):
 
     if is_active:
         print(f"  {C.GREEN}\u251c\u2500 {domain}{C.RESET}")
-        for ip in ips:
-            print(f"  {C.GREEN}\u2502  \u2192 {ip}{C.RESET}")
     else:
         print(f"  {C.RED}\u251c\u2500 {domain}{C.RESET}")
         if verbose and error:
@@ -207,19 +205,12 @@ async def check_domain(domain: str, resolver: aiodns.DNSResolver, sem: asyncio.S
 
     async with sem:
         try:
-            resp = await resolver.getaddrinfo(domain, socket.AF_INET)
+            resp = await resolver.gethostbyname(domain, socket.AF_INET)
             result["active"] = True
-            # Extract IPs from AddrInfoResult nodes
+            # gethostbyname returns HostResult with .addresses (list of IP strings)
             ips = []
-            if hasattr(resp, 'nodes'):
-                for node in resp.nodes:
-                    if hasattr(node, 'addr') and node.addr:
-                        ip = node.addr[0] if isinstance(node.addr, tuple) else node.addr
-                        if isinstance(ip, bytes):
-                            ip = ip.decode()
-                        ips.append(ip)
-            elif hasattr(resp, 'addresses'):
-                ips = resp.addresses
+            if hasattr(resp, 'addresses'):
+                ips = [str(addr) for addr in resp.addresses]
             result["ip"] = list(set(ips)) if ips else ["resolved"]
         except aiodns.error.DNSError as e:
             result["error"] = str(e)
@@ -286,6 +277,14 @@ async def async_main(args):
         for d in domains
     ]
     await asyncio.gather(*tasks)
+
+    # Shutdown resolver channel to prevent pycares callbacks after loop close
+    try:
+        resolver.cancel()
+    except Exception:
+        pass
+    # Allow pending callbacks to drain
+    await asyncio.sleep(0.1)
 
     # Final
     sys.stdout.write("\n")
