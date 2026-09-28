@@ -23,7 +23,6 @@ Usage:
 import socket, sys, os, ssl, time, signal, argparse, asyncio, random
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from urllib.request import urlopen, Request
 
 try:
     import aiohttp
@@ -38,12 +37,9 @@ try:
 except ImportError:
     HAS_DNSPYTHON = False
 
-VERSION = "1.2"
+VERSION = "1.3"
 
-RESOLVERS_URL = "https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt"
-
-# Fallback DNS resolvers (if download fails)
-FALLBACK_DNS_SERVERS = [
+DNS_SERVERS = [
     "8.8.8.8",       # Google
     "8.8.4.4",       # Google
     "1.1.1.1",       # Cloudflare
@@ -53,23 +49,6 @@ FALLBACK_DNS_SERVERS = [
     "208.67.222.222",  # OpenDNS
     "208.67.220.220",  # OpenDNS
 ]
-
-
-def fetch_resolvers() -> list:
-    """Download resolvers from trickest/resolvers. Fallback to default if fails."""
-    try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        req = Request(RESOLVERS_URL, headers={"User-Agent": "wpurl"})
-        with urlopen(req, timeout=10, context=ctx) as resp:
-            text = resp.read().decode("utf-8")
-        servers = [line.strip() for line in text.splitlines() if line.strip()]
-        if servers:
-            return servers
-    except Exception:
-        pass
-    return FALLBACK_DNS_SERVERS
 
 # ═══════════════════════════════════════════════════════════════
 # Colors
@@ -523,10 +502,10 @@ async def async_main(args):
 
     print(f"  {C.CYAN}[*] Loaded {len(domains)} targets{C.RESET}")
 
-    # Fetch resolvers from trickest
-    dns_servers = fetch_resolvers()
+    # DNS servers
+    dns_servers = DNS_SERVERS
     if HAS_DNSPYTHON:
-        print(f"  {C.CYAN}[*] DNS resolvers: {len(dns_servers)} servers (auto-downloaded + round-robin){C.RESET}")
+        print(f"  {C.CYAN}[*] DNS resolvers: {len(dns_servers)} servers (round-robin + retry){C.RESET}")
     else:
         print(f"  {C.YELLOW}[*] dnspython not installed, using system resolver{C.RESET}")
 
