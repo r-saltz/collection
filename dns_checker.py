@@ -167,7 +167,8 @@ class FileOutput:
             else:
                 domain = result["domain"]
                 status = "ACTIVE" if result.get("active") else "INACTIVE"
-                ips = ", ".join(result.get("ip", [])) or "-"
+                ip_list = result.get("ip") or []  # Handle None or missing
+                ips = ", ".join(ip_list) if ip_list else "-"
                 with open(self.path, "a") as f:
                     f.write(f"  {domain:<40} {status:<10} {ips}\n")
 
