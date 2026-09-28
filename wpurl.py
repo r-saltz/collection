@@ -535,27 +535,14 @@ async def async_main(args):
     # Phase 2: WordPress
     wp_domains = await phase_wp(active_domains, args.workers, args.timeout)
 
-    # Output
+    # Output (domains only)
     out_file = args.output
     with open(out_file, "w") as f:
         for item in sorted(wp_domains, key=lambda x: x["domain"]):
-            domain = item["domain"]
-            templates = item.get("templates", [])
-            if templates:
-                f.write(f"{domain} | {', '.join(templates)}\n")
-            else:
-                f.write(f"{domain}\n")
+            f.write(item["domain"] + "\n")
 
     if wp_domains:
         print(f"  {C.GREEN}{C.BOLD}[*] {len(wp_domains)} WordPress sites \u2192 {out_file}{C.RESET}")
-        # Show templates in terminal
-        for item in sorted(wp_domains, key=lambda x: x["domain"]):
-            domain = item["domain"]
-            templates = item.get("templates", [])
-            if templates:
-                print(f"  {C.GREEN}  \u2514 {domain} \u2192 {', '.join(templates)}{C.RESET}")
-            else:
-                print(f"  {C.GREEN}  \u2514 {domain}{C.RESET}")
     else:
         print(f"  {C.YELLOW}[*] No WordPress sites found.{C.RESET}")
 
