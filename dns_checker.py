@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""DNS Domain Activity Checker v3.0 (Async / aiodns)
+"""DNS Domain Activity Checker v3.1 (Async / asyncio)
 Check A record only. Green = active, Red = inactive.
 
 Features:
-  - Async DNS resolution via aiodns
+  - Async DNS resolution via asyncio.getaddrinfo (stdlib, no external deps)
   - Semaphore-based concurrency (100-500+ coroutines)
   - In-place progress bar with live stats
   - Incremental crash-safe file output
@@ -19,13 +19,7 @@ Usage:
 import socket, sys, os, json, time, signal, argparse, asyncio
 from datetime import datetime
 
-try:
-    import aiodns
-except ImportError:
-    print("\033[91m[!] aiodns required: pip install aiodns\033[0m")
-    sys.exit(1)
-
-VERSION = "3.0"
+VERSION = "3.1"
 
 # ═══════════════════════════════════════════════════════════════
 # Colors
@@ -71,11 +65,11 @@ def banner():
 \u2551  \u2588\u2588\u2580 \u2580\u2588\u2588\u2588  \u2588\u2588\u2580 \u2588\u2588\u2580 \u2588\u2588\u2588  \u2588\u2588\u2588  \u2588\u2588\u2580 \u2588\u2588\u2580 \u2588\u2588\u2580 \u2588\u2588\u2588  \u2588\u2588  \u2580\u2588\u2588\u2580 \u2580\u2588\u2588\u2580  \u2551
 \u2551  \u2588\u2588       \u2588\u2588\u2580 \u2588\u2588\u2580 \u2588\u2588\u2580 \u2588\u2588\u2580  \u2588\u2588       \u2588\u2588\u2580 \u2588\u2588\u2580 \u2588\u2588\u2580  \u2588\u2588\u2580\u2588\u2588  \u2588\u2588   \u2588\u2588    \u2551
 \u2551  \u2588\u2588       \u2588\u2588     \u2580\u2588\u2580  \u2580\u2588\u2580   \u2588\u2588       \u2580\u2588\u2580   \u2580\u2588\u2580  \u2588\u2588   \u2588\u2588   \u2588\u2588    \u2551
-\u2551       DNS Domain Activity Checker {VERSION:<12} (async/aiodns)  \u2551
+\u2551       DNS Domain Activity Checker {VERSION:<12} (async/stdlib)  \u2551
 \u255a{'\u2550' * 49}\u255d{C.RESET}
 """)
     print(f"  {C.WHITE}Check   : A Record only")
-    print(f"  {C.WHITE}Engine  : aiodns + asyncio.Semaphore{C.RESET}")
+    print(f"  {C.WHITE}Engine  : asyncio.getaddrinfo (stdlib){C.RESET}")
     print(f"  {C.WHITE}Usage   : python3 dns_checker.py [options]{C.RESET}")
     print()
 
@@ -189,7 +183,7 @@ class FileOutput:
 _print_lock = asyncio.Lock()
 _weblive_lock = asyncio.Lock()
 
-async def check_domain(domain: str, resolver: aiodns.DNSResolver, sem: asyncio.Semaphore,
+async def check_domain(domain: str, sem: asyncio.Semaphore,
                         progress: Progress, file_out: FileOutput, verbose: bool):
     global _shutdown
     if _shutdown:
@@ -205,15 +199,19 @@ async def check_domain(domain: str, resolver: aiodns.DNSResolver, sem: asyncio.S
 
     async with sem:
         try:
-            resp = await resolver.gethostbyname(domain, socket.AF_INET)
-            result["active"] = True
-            # gethostbyname returns HostResult with .addresses (list of IP strings)
-            ips = []
-            if hasattr(resp, 'addresses'):
-                ips = [str(addr) for addr in resp.addresses]
-            result["ip"] = list(set(ips)) if ips else ["resolved"]
-        except aiodns.error.DNSError as e:
+            loop = asyncio.get_event_loop()
+            infos = await asyncio.wait_for(
+                loop.getaddrinfo(domain, None, family=socket.AF_INET),
+                timeout=5
+            )
+            ips = list(set(info[4][0] for info in infos))
+            if ips:
+                result["active"] = True
+                result["ip"] = ips
+        except (socket.gaierror, OSError) as e:
             result["error"] = str(e)
+        except asyncio.TimeoutError:
+            result["error"] = "DNS timeout"
         except Exception as e:
             result["error"] = str(e)
 
@@ -266,25 +264,16 @@ async def async_main(args):
         f.write(f"# Active domains - {datetime.now():%Y-%m-%d %H:%M:%S}\n")
 
     # Init
-    resolver = aiodns.DNSResolver(timeout=5, tries=2, rotate=True)
     sem = asyncio.Semaphore(args.workers)
     progress = Progress(total)
     file_out = FileOutput(args.output, json_mode=args.json) if args.output else None
 
     # Run all tasks
     tasks = [
-        check_domain(d, resolver, sem, progress, file_out, args.verbose)
+        check_domain(d, sem, progress, file_out, args.verbose)
         for d in domains
     ]
     await asyncio.gather(*tasks)
-
-    # Shutdown resolver channel to prevent pycares callbacks after loop close
-    try:
-        resolver.cancel()
-    except Exception:
-        pass
-    # Allow pending callbacks to drain
-    await asyncio.sleep(0.1)
 
     # Final
     sys.stdout.write("\n")
