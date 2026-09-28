@@ -330,13 +330,6 @@ async def phase_dns(domains: list, workers: int, verbose: bool,
 # ═══════════════════════════════════════════════════════════════
 # Phase 2: WordPress Detection
 # ═══════════════════════════════════════════════════════════════
-WP_BODY_SIGS = [
-    "wp-content/", "wp-includes/", "/wp-json", "/wp-login.php",
-    "wp-embed.min.js", "wp-includes/js/", "wp-content/themes/",
-    "wp-content/plugins/",
-]
-WP_HEADER_SIGS = ["x-powered-by: wordpress", "link: <http.*wp-json"]
-
 # REST API endpoints for probing
 WP_REST_ENDPOINTS = [
     "/wp-json/wp/v2/pages?per_page=1&_fields=id,slug,link,template",
@@ -495,28 +488,25 @@ async def phase_wp(domains: list, workers: int, timeout: int) -> list:
 # ═══════════════════════════════════════════════════════════════
 async def _is_wp(session, domain: str, timeout: int) -> bool:
     url = f"https://{domain}"
-    status, headers, body = await http_get(session, url, timeout)
 
-    score = 0
-    for sig in WP_HEADER_SIGS:
-        key, _, val = sig.partition(": ")
-        if val in headers.get(key, ""):
-            score += 3
-    for sig in WP_BODY_SIGS:
-        if sig in body:
-            score += 1
-    if 'content="wordpress' in body:
-        score += 5
-    if score >= 4:
+    # 1. Probe /wp-json
+    s1, _, b1 = await http_get(session, f"{url}/wp-json", timeout)
+    if s1 == 200 and ("wp-json" in b1 or "namespaces" in b1):
         return True
 
-    s2, _, b2 = await http_get(session, f"{url}/wp-login.php", timeout)
-    if s2 == 200 and ("wp-login" in b2 or "wordpress" in b2):
-        return True
+    # 2. Probe REST API JSON endpoints
+    for endpoint in WP_REST_ENDPOINTS:
+        s, data = await http_get_json(session, f"{url}{endpoint}", timeout)
+        if s == 200 and data is not None:
+            if isinstance(data, (list, dict)):
+                return True
 
-    s3, _, b3 = await http_get(session, f"{url}/wp-json", timeout)
-    if s3 == 200 and ("wp-json" in b3 or "namespaces" in b3):
-        return True
+    # 3. Probe REST API body check
+    for endpoint in WP_REST_ENDPOINTS:
+        s, _, b = await http_get(session, f"{url}{endpoint}", timeout)
+        if s == 200 and b:
+            if any(sig in b for sig in ["wp-json", "namespace", "wp/v2", "block-renderer", "batch"]):
+                return True
 
     return False
 
