@@ -21,6 +21,7 @@ Usage:
 """
 
 import socket, sys, os, ssl, time, signal, argparse, asyncio, random
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from urllib.request import urlopen, Request
 
@@ -168,32 +169,35 @@ class Progress:
 # DNS Resolver Pool (Round-Robin + Retry)
 # ═══════════════════════════════════════════════════════════════
 class DNSResolverPool:
-    """Pool of DNS resolvers with round-robin rotation and retry."""
+    """Pool of DNS resolvers with random selection and retry."""
 
     def __init__(self, servers: list):
         self.servers = servers
-        self._idx = 0
-        self._lock = asyncio.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=500)
 
-    async def next_resolver(self):
-        """Get next resolver in round-robin fashion."""
-        async with self._lock:
-            server = self.servers[self._idx % len(self.servers)]
-            self._idx += 1
+    def _make_resolver(self, server: str):
         resolver = dns.resolver.Resolver(configure=False)
         resolver.nameservers = [server]
-        resolver.lifetime = 3
-        resolver.timeout = 3
-        return resolver, server
+        resolver.lifetime = 2
+        resolver.timeout = 2
+        return resolver
 
-    async def resolve(self, domain: str, max_retries: int = 3) -> bool:
+    async def resolve(self, domain: str, max_retries: int = 2) -> bool:
         """Resolve domain A record. Returns True if active.
-        Retries with different resolvers on failure."""
+        Random resolver selection, retry with different resolver on failure."""
+        loop = asyncio.get_event_loop()
+        used = set()
         for attempt in range(max_retries):
-            resolver, server = await self.next_resolver()
+            # Pick random server not yet used
+            available = [s for s in self.servers if s not in used]
+            if not available:
+                break
+            server = random.choice(available)
+            used.add(server)
             try:
-                answers = await asyncio.get_event_loop().run_in_executor(
-                    None, resolver.resolve, domain, 'A'
+                resolver = self._make_resolver(server)
+                answers = await loop.run_in_executor(
+                    self._executor, resolver.resolve, domain, 'A'
                 )
                 if answers:
                     return True
