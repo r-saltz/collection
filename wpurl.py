@@ -204,10 +204,6 @@ async def dns_check(domain: str, sem: asyncio.Semaphore,
     await progress.update("active" if active else "inactive")
 
     async with _print_lock:
-        sys.stdout.write("\r" + " " * 120 + "\r")
-        sys.stdout.flush()
-        color = C.GREEN if active else C.RED
-        print(f"  {color}\u251c\u2500 {domain}{C.RESET}")
         sys.stdout.write(progress.bar())
         sys.stdout.flush()
 
@@ -284,12 +280,6 @@ async def phase_wp(domains: list, workers: int, timeout: int) -> list:
             if wp:
                 wp_domains.append(domain)
             async with _print_lock:
-                sys.stdout.write("\r" + " " * 120 + "\r")
-                sys.stdout.flush()
-                if wp:
-                    print(f"  {C.GREEN}\u251c\u2500 {domain} \u2192 WordPress{C.RESET}")
-                else:
-                    print(f"  {C.DIM}\u251c\u2500 {domain} \u2192 Other{C.RESET}")
                 sys.stdout.write(progress.bar())
                 sys.stdout.flush()
 
