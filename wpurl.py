@@ -20,7 +20,7 @@ Usage:
     python3 wpurl.py google.com example.com
 """
 
-import socket, sys, os, ssl, time, signal, argparse, asyncio
+import socket, sys, os, ssl, time, signal, argparse, asyncio, random
 from datetime import datetime
 
 try:
@@ -29,7 +29,26 @@ except ImportError:
     print("\033[91m[!] aiohttp required: pip install aiohttp\033[0m")
     sys.exit(1)
 
-VERSION = "1.0"
+try:
+    import dns.resolver
+    import dns.rdatatype
+    HAS_DNSPYTHON = True
+except ImportError:
+    HAS_DNSPYTHON = False
+
+VERSION = "1.1"
+
+# Default DNS resolvers (multiple providers for rotation)
+DEFAULT_DNS_SERVERS = [
+    "8.8.8.8",       # Google
+    "8.8.4.4",       # Google
+    "1.1.1.1",       # Cloudflare
+    "1.0.0.1",       # Cloudflare
+    "9.9.9.9",       # Quad9
+    "149.112.112.112",  # Quad9
+    "208.67.222.222",  # OpenDNS
+    "208.67.220.220",  # OpenDNS
+]
 
 # ═══════════════════════════════════════════════════════════════
 # Colors
@@ -126,6 +145,49 @@ class Progress:
 
 
 # ═══════════════════════════════════════════════════════════════
+# DNS Resolver Pool (Round-Robin + Retry)
+# ═══════════════════════════════════════════════════════════════
+class DNSResolverPool:
+    """Pool of DNS resolvers with round-robin rotation and retry."""
+
+    def __init__(self, servers: list):
+        self.servers = servers
+        self._idx = 0
+        self._lock = asyncio.Lock()
+
+    async def next_resolver(self):
+        """Get next resolver in round-robin fashion."""
+        async with self._lock:
+            server = self.servers[self._idx % len(self.servers)]
+            self._idx += 1
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = [server]
+        resolver.lifetime = 3
+        resolver.timeout = 3
+        return resolver, server
+
+    async def resolve(self, domain: str, max_retries: int = 3) -> bool:
+        """Resolve domain A record. Returns True if active.
+        Retries with different resolvers on failure."""
+        for attempt in range(max_retries):
+            resolver, server = await self.next_resolver()
+            try:
+                answers = await asyncio.get_event_loop().run_in_executor(
+                    None, resolver.resolve, domain, 'A'
+                )
+                if answers:
+                    return True
+            except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+                return False
+            except (dns.resolver.NoNameservers, dns.resolver.Timeout,
+                    dns.exception.DNSException, OSError):
+                continue
+            except Exception:
+                continue
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════
 # Shared Helpers
 # ═══════════════════════════════════════════════════════════════
 _print_lock = asyncio.Lock()
@@ -183,23 +245,27 @@ def print_summary(phase: str, progress: Progress):
 # Phase 1: DNS Check
 # ═══════════════════════════════════════════════════════════════
 async def dns_check(domain: str, sem: asyncio.Semaphore,
-                    progress: Progress, verbose: bool) -> bool:
+                    progress: Progress, verbose: bool,
+                    resolver_pool: DNSResolverPool = None) -> bool:
     global _shutdown
     if _shutdown:
         return False
 
     active = False
     async with sem:
-        try:
-            loop = asyncio.get_event_loop()
-            infos = await asyncio.wait_for(
-                loop.getaddrinfo(domain, None, family=socket.AF_INET),
-                timeout=5
-            )
-            if infos:
-                active = True
-        except Exception:
-            pass
+        if resolver_pool and HAS_DNSPYTHON:
+            active = await resolver_pool.resolve(domain)
+        else:
+            try:
+                loop = asyncio.get_event_loop()
+                infos = await asyncio.wait_for(
+                    loop.getaddrinfo(domain, None, family=socket.AF_INET),
+                    timeout=5
+                )
+                if infos:
+                    active = True
+            except Exception:
+                pass
 
     await progress.update("active" if active else "inactive")
 
@@ -210,15 +276,21 @@ async def dns_check(domain: str, sem: asyncio.Semaphore,
     return active
 
 
-async def phase_dns(domains: list, workers: int, verbose: bool) -> list:
-    print(f"\n  {C.CYAN}{C.BOLD}[1/2 DNS]{C.RESET} Checking {len(domains)} domains | {workers} workers")
+async def phase_dns(domains: list, workers: int, verbose: bool,
+                    dns_servers: list = None) -> list:
+    resolver_pool = None
+    if HAS_DNSPYTHON and dns_servers:
+        resolver_pool = DNSResolverPool(dns_servers)
+        print(f"\n  {C.CYAN}{C.BOLD}[1/2 DNS]{C.RESET} Checking {len(domains)} domains | {workers} workers | {len(dns_servers)} resolvers{C.RESET}")
+    else:
+        print(f"\n  {C.CYAN}{C.BOLD}[1/2 DNS]{C.RESET} Checking {len(domains)} domains | {workers} workers{C.RESET}")
     print()
 
     sem = asyncio.Semaphore(workers)
     progress = Progress(len(domains), "DNS")
 
     results = await asyncio.gather(*[
-        dns_check(d, sem, progress, verbose) for d in domains
+        dns_check(d, sem, progress, verbose, resolver_pool) for d in domains
     ])
 
     active_domains = [d for d, ok in zip(domains, results) if ok]
@@ -334,8 +406,17 @@ async def async_main(args):
 
     print(f"  {C.CYAN}[*] Loaded {len(domains)} targets{C.RESET}")
 
+    # DNS servers
+    dns_servers = DEFAULT_DNS_SERVERS
+    if args.dns_server:
+        dns_servers = [s.strip() for s in args.dns_server.split(",") if s.strip()]
+    if HAS_DNSPYTHON:
+        print(f"  {C.CYAN}[*] DNS resolvers: {len(dns_servers)} servers (round-robin + retry){C.RESET}")
+    else:
+        print(f"  {C.YELLOW}[*] dnspython not installed, using system resolver{C.RESET}")
+
     # Phase 1: DNS
-    active_domains = await phase_dns(domains, args.workers, args.verbose)
+    active_domains = await phase_dns(domains, args.workers, args.verbose, dns_servers)
     if not active_domains:
         print(f"  {C.YELLOW}[!] No active domains found.{C.RESET}")
         return
@@ -376,6 +457,7 @@ def main():
     parser.add_argument("-t", "--timeout", type=int, default=10, help="HTTP timeout in seconds (default: 10)")
     parser.add_argument("-o", "--output", default="wordpress.txt", help="Output file (default: wordpress.txt)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show inactive domains")
+    parser.add_argument("--dns-server", help="DNS servers comma-separated (default: Google,Cloudflare,Quad9,OpenDNS)")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
     parser.add_argument("--version", action="version", version=f"wpurl {VERSION}")
 
