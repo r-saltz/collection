@@ -152,11 +152,6 @@ class FileOutput:
         self.json_mode = json_mode
         self.results = []
         self.lock = asyncio.Lock()
-        if not json_mode:
-            with open(path, "w") as f:
-                f.write(f"# DNS Domain Check - {datetime.now():%Y-%m-%d %H:%M:%S}\n")
-                f.write(f"# {'Domain':<40} {'Status':<10} {'IP'}\n")
-                f.write("# " + "-" * 70 + "\n")
 
     async def write(self, result: dict):
         async with self.lock:
@@ -165,17 +160,11 @@ class FileOutput:
                 with open(self.path, "w") as f:
                     json.dump(self.results, f, indent=2)
             else:
-                domain = result["domain"]
-                status = "ACTIVE" if result.get("active") else "INACTIVE"
-                ip_list = result.get("ip") or []  # Handle None or missing
-                ips = ", ".join(ip_list) if ip_list else "-"
                 with open(self.path, "a") as f:
-                    f.write(f"  {domain:<40} {status:<10} {ips}\n")
+                    f.write(result["domain"] + "\n")
 
     def close(self, total, active, inactive):
-        if not self.json_mode:
-            with open(self.path, "a") as f:
-                f.write(f"\n# Summary: {total} checked | {active} active | {inactive} inactive\n")
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════
