@@ -520,6 +520,9 @@ async def async_main(args):
 
     # Output (domains only)
     out_file = args.output
+    out_dir = os.path.dirname(out_file)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(out_file, "w") as f:
         for item in sorted(wp_domains, key=lambda x: x["domain"]):
             f.write(item["domain"] + "\n")
